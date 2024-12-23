@@ -7,9 +7,6 @@
  *  Based on acer_acpi:
  *    Copyright (C) 2005-2007	E.M. Smith
  *    Copyright (C) 2007-2008	Carlos Corbacho <cathectic@gmail.com>
- *
- *  Added support for Acer Predator hotkeys:
- *    Copyright (C) 2021        Bernhard Rosenkraenzer <bero@lindev.ch>
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -19,7 +16,6 @@
 #include <linux/init.h>
 #include <linux/types.h>
 #include <linux/dmi.h>
-#include <linux/fb.h>
 #include <linux/backlight.h>
 #include <linux/leds.h>
 #include <linux/platform_device.h>
@@ -31,31 +27,14 @@
 #include <linux/debugfs.h>
 #include <linux/slab.h>
 #include <linux/input.h>
-#include <linux/cdev.h>
 #include <linux/input/sparse-keymap.h>
 #include <acpi/video.h>
 #include <linux/hwmon.h>
 #include <linux/bitfield.h>
-#include <linux/version.h>
 
 MODULE_AUTHOR("Carlos Corbacho");
 MODULE_DESCRIPTION("Acer Laptop WMI Extras Driver");
 MODULE_LICENSE("GPL");
-
-/*
- * RTLNX_VER_MIN
- * Evaluates to true if the linux kernel version is equal or higher to the
- * one specfied.
- */
-#define RTLNX_VER_MIN(a_Major, a_Minor, a_Patch) \
-    (LINUX_VERSION_CODE >= KERNEL_VERSION(a_Major, a_Minor, a_Patch))
-
-/*
- * RTLNX_VER_MAX
- * Evaluates to true if the linux kernel version is less to the one specfied
- * (exclusive). */
-#define RTLNX_VER_MAX(a_Major, a_Minor, a_Patch) \
-    (LINUX_VERSION_CODE < KERNEL_VERSION(a_Major, a_Minor, a_Patch))
 
 /*
  * Magic Number
@@ -82,14 +61,10 @@ MODULE_LICENSE("GPL");
 #define ACER_WMID_SET_BRIGHTNESS_METHODID	6
 #define ACER_WMID_GET_THREEG_METHODID		10
 #define ACER_WMID_SET_THREEG_METHODID		11
-#define ACER_WMID_SET_GAMINGKBBL_METHODID		20
-#define ACER_WMID_GET_GAMINGKBBL_METHODID		21
-
 
 #define ACER_WMID_SET_GAMING_LED_METHODID 2
 #define ACER_WMID_GET_GAMING_LED_METHODID 4
 #define ACER_WMID_GET_GAMING_SYS_INFO_METHODID 5
-#define ACER_WMID_SET_GAMING_STATIC_LED_METHODID 6
 #define ACER_WMID_SET_GAMING_FAN_BEHAVIOR 14
 #define ACER_WMID_SET_GAMING_MISC_SETTING_METHODID 22
 
@@ -170,26 +145,6 @@ static const struct key_entry acer_wmi_keymap[] __initconst = {
 	{KE_KEY, 0x85, {KEY_TOUCHPAD_TOGGLE} },
 	{KE_KEY, 0x86, {KEY_WLAN} },
 	{KE_KEY, 0x87, {KEY_POWER} },
-	/* Acer Predator macro keys:
-		* 0xdaXY:
-		*   da   - magic value (preDAtor)
-		*     X  - macro key selector state (0: red, 1: blue, 2: green)
-		*      Y - key pressed (0: 1, 1: 2, ...) */
-	{KE_KEY, 0xda00, {KEY_PROG1} },
-	{KE_KEY, 0xda01, {KEY_PROG2} },
-	{KE_KEY, 0xda02, {KEY_PROG3} },
-	{KE_KEY, 0xda03, {KEY_PROG4} },
-	{KE_KEY, 0xda04, {KEY_F13} },
-	{KE_KEY, 0xda10, {KEY_F14} },
-	{KE_KEY, 0xda11, {KEY_F15} },
-	{KE_KEY, 0xda12, {KEY_F16} },
-	{KE_KEY, 0xda13, {KEY_F17} },
-	{KE_KEY, 0xda14, {KEY_F18} },
-	{KE_KEY, 0xda20, {KEY_F19} },
-	{KE_KEY, 0xda21, {KEY_F20} },
-	{KE_KEY, 0xda22, {KEY_F21} },
-	{KE_KEY, 0xda23, {KEY_F22} },
-	{KE_KEY, 0xda24, {KEY_F23} },
 	{KE_END, 0}
 };
 
@@ -215,25 +170,6 @@ struct event_return_value {
 #define ACER_WMID3_GDS_RFBTN		(1<<14)	/* RF Button */
 
 #define ACER_WMID3_GDS_TOUCHPAD		(1<<1)	/* Touchpad */
-
-/*
- * Gaming functions user-space communication
- * A character drive will be exposed in /dev/acer-gkbbl as char block for keyboard dynamic backlight config
- * Config length is 16 bytes
- */
-
-#define GAMING_KBBL_CHR "acer-gkbbl"
-#define GAMING_KBBL_CONFIG_LEN 16
-
-
-/*
- * Gaming functions user-space communication
- * A character drive will be exposed in /dev/acer-gkbbl-static as char block for keyboard static backlight config
- * Config length is 16 bytes
- */
-
-#define GAMING_KBBL_STATIC_CHR "acer-gkbbl-static"
-#define GAMING_KBBL_STATIC_CONFIG_LEN 4
 
 /* Hotkey Customized Setting and Acer Application Status.
  * Set Device Default Value and Report Acer Application Status.
@@ -311,8 +247,6 @@ struct hotkey_function_type_aa {
 #define ACER_CAP_TURBO_FAN		BIT(9)
 #define ACER_CAP_PLATFORM_PROFILE	BIT(10)
 #define ACER_CAP_FAN_SPEED_READ		BIT(11)
-#define ACER_CAP_GAMINGKB		BIT(12)
-#define ACER_CAP_GAMINGKB_STATIC	BIT(13)
 
 /*
  * Interface type flags
@@ -322,13 +256,7 @@ enum interface_flags {
 	ACER_AMW0_V2,
 	ACER_WMID,
 	ACER_WMID_v2,
-	ACER_WMID_GAMING,
 };
-
-#define ACER_DEFAULT_WIRELESS  0
-#define ACER_DEFAULT_BLUETOOTH 0
-#define ACER_DEFAULT_MAILLED   0
-#define ACER_DEFAULT_THREEG    0
 
 static int max_brightness = 0xF;
 
@@ -363,20 +291,6 @@ MODULE_PARM_DESC(cycle_gaming_thermal_profile,
 MODULE_PARM_DESC(predator_v4,
 	"Enable features for predator laptops that use predator sense v4");
 
-#ifdef lts
-int platform_profile_remove()
-{
-	return 0;
-}
-int platform_profile_register(struct platform_profile_handler* platform_profile_handler)
-{
-	return 0;
-}
-void platform_profile_notify()
-{
-}
-#endif
-
 struct acer_data {
 	int mailled;
 	int threeg;
@@ -410,22 +324,6 @@ struct wmi_interface {
 
 /* The static interface pointer, points to the currently detected interface */
 static struct wmi_interface *interface;
-
-/* The static gaming interface pointer, points to the currently detected gaming interface */
-static struct wmi_interface *gaming_interface;
-
-/*
- * Character device registration
- * GAMING_KBBL_MINOR -> used to configure gaming rgb keyboard backlights from user-space
- */
-
-#define GAMING_KBBL_MINOR 0
-#define GAMING_KBBL_STATIC_MINOR 0
-
-
-static dev_t gkbbl_static_dev; // Global variable to store the static kbbl device
-static dev_t gkbbl_dynamic_dev; // Global variable to store the dynamic kbbl device
-
 
 /*
  * Embedded Controller quirks
@@ -1516,44 +1414,6 @@ static struct wmi_interface wmid_v2_interface = {
  * WMID Gaming interface
  */
 
-static struct wmi_interface wmid_gaming_interface = {
-	.type = ACER_WMID_GAMING
-};
-
-static acpi_status
-WMI_gaming_execute_u8_array(u32 method_id, u8 array[], size_t array_size, u32 *out)
-{
-	struct acpi_buffer input = { (acpi_size) array_size, (void *)(array) };
-	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
-	union acpi_object *obj;
-	u32 tmp = 0;
-	acpi_status status;
-
-	status = wmi_evaluate_method(WMID_GUID4, 0, method_id, &input, &result);
-
-	if (ACPI_FAILURE(status))
-		return status;
-
-	obj = (union acpi_object *) result.pointer;
-	if (obj) {
-		if (obj->type == ACPI_TYPE_BUFFER &&
-			(obj->buffer.length == sizeof(u32) ||
-			obj->buffer.length == sizeof(u64))) {
-			tmp = *((u32 *) obj->buffer.pointer);
-		} else if (obj->type == ACPI_TYPE_INTEGER) {
-			tmp = (u32) obj->integer.value;
-		}
-	}
-
-	if (out)
-		*out = tmp;
-
-	kfree(result.pointer);
-
-	return status;
-}
-
-
 static acpi_status
 WMI_gaming_execute_u64(u32 method_id, u64 in, u64 *out)
 {
@@ -1605,31 +1465,11 @@ static acpi_status WMID_gaming_set_u64(u64 value, u32 cap)
 	case ACER_CAP_TURBO_OC:
 		method_id = ACER_WMID_SET_GAMING_MISC_SETTING_METHODID;
 		break;
-	case ACER_CAP_GAMINGKB_STATIC:
-		method_id = ACER_WMID_SET_GAMING_STATIC_LED_METHODID;
-		return WMI_gaming_execute_u64(method_id, value, NULL);
 	default:
 		return AE_BAD_PARAMETER;
 	}
 
 	return WMI_gaming_execute_u64(method_id, value, NULL);
-}
-
-
-static acpi_status WMID_gaming_set_u8_array(u8 array[], size_t array_size, u32 cap)
-{
-	u32 method_id = 0;
-
-	switch (cap) {
-	case ACER_CAP_GAMINGKB:
-		if (array_size != GAMING_KBBL_CONFIG_LEN)
-			return AE_BAD_PARAMETER;
-		method_id = ACER_WMID_SET_GAMINGKBBL_METHODID;
-		break;
-	default:
-		return AE_ERROR;
-	}
-	return WMI_gaming_execute_u8_array(method_id, array, array_size, NULL);
 }
 
 static acpi_status WMID_gaming_get_u64(u64 *value, u32 cap)
@@ -1756,29 +1596,6 @@ static acpi_status set_u32(u32 value, u32 cap)
 	return AE_BAD_PARAMETER;
 }
 
-static acpi_status set_u8_array(u8 array[], size_t array_size, u32 cap)
-{
-	acpi_status status;
-
-	if (interface->capability & cap) {
-		switch (interface->type) {
-		default:
-			return AE_BAD_PARAMETER;
-		}
-	} else if (gaming_interface->capability & cap) {
-		switch (gaming_interface->type) {
-		case ACER_WMID_GAMING:
-			status = WMID_gaming_set_u8_array(array, array_size, cap);
-			if (ACPI_FAILURE(status))
-				return status;
-			fallthrough;
-		default:
-			return AE_BAD_PARAMETER;
-		}
-	}
-	return AE_BAD_PARAMETER;
-}
-
 static void __init acer_commandline_init(void)
 {
 	/*
@@ -1816,221 +1633,6 @@ static void acer_led_exit(void)
 {
 	set_u32(LED_OFF, ACER_CAP_MAILLED);
 	led_classdev_unregister(&mail_led);
-}
-
-/*
- * Keyboard RGB backlight character device handler.
- * On systems supporting Acer gaming functions, a char device
- * will be exposed to communicate with user space
- * for keyboard RGB backlight configurations.
- */
-
-static ssize_t gkbbl_drv_write(struct file *file,
-		const char __user *buf, size_t count, loff_t *offset)
-{
-	u8 config_buf[GAMING_KBBL_CONFIG_LEN];
-	unsigned long err;
-
-	if (count != GAMING_KBBL_CONFIG_LEN) {
-		pr_err("Invalid data given to gaming keyboard backlight");
-		return 0;
-	}
-	err = copy_from_user(config_buf, buf, GAMING_KBBL_CONFIG_LEN);
-	if (err < 0)
-		pr_err("Copying data from userspace failed with code: %lu\n", err);
-
-	set_u8_array(config_buf, GAMING_KBBL_CONFIG_LEN, ACER_CAP_GAMINGKB);
-	return count;
-}
-
-
-static const struct file_operations gkbbl_dev_fops = {
-		.owner      = THIS_MODULE,
-		.write       = gkbbl_drv_write
-};
-
-struct gkbbl_device_data {
-	struct cdev cdev;
-};
-
-static struct class *gkbbl_dev_class;
-static struct gkbbl_device_data gkbbl_dev_data;
-
-static int gkbbl_dev_uevent(
-#if RTLNX_VER_MIN(6, 2, 0)
-const
-#endif
-struct device *dev, struct kobj_uevent_env *env)
-{
-	add_uevent_var(env, "DEVMODE=%#o", 0666);
-	return 0;
-}
-
-static int __init gaming_kbbl_cdev_init(void)
-{
-	dev_t dev;
-	int err;
-
-	err = alloc_chrdev_region(&dev, 0, 1, GAMING_KBBL_CHR);
-	if (err < 0) {
-		pr_err("Char drive registering for gaming keyboard backlight failed: %d\n", err);
-		return err;
-	}
-
-	gkbbl_dynamic_dev = dev;
-
-	#if RTLNX_VER_MIN(6, 4, 0)
-		gkbbl_dev_class = class_create(GAMING_KBBL_CHR);
-	#else
-		gkbbl_dev_class = class_create(THIS_MODULE, GAMING_KBBL_CHR);
-	#endif
-
-	gkbbl_dev_class->dev_uevent = gkbbl_dev_uevent;
-
-	cdev_init(&gkbbl_dev_data.cdev, &gkbbl_dev_fops);
-	gkbbl_dev_data.cdev.owner = THIS_MODULE;
-
-	cdev_add(&gkbbl_dev_data.cdev, gkbbl_dynamic_dev, 1);
-
-	device_create(gkbbl_dev_class, NULL, gkbbl_dynamic_dev, NULL, "%s-%d",
-			   GAMING_KBBL_CHR,
-			   GAMING_KBBL_MINOR);
-
-	return 0;
-}
-
-static void __exit gaming_kbbl_cdev_exit(void)
-{
-	device_destroy(gkbbl_dev_class, gkbbl_dynamic_dev);
-
-	class_unregister(gkbbl_dev_class);
-	class_destroy(gkbbl_dev_class);
-	cdev_del(&gkbbl_dev_data.cdev);
-
-	unregister_chrdev_region(gkbbl_dynamic_dev, 1);
-}
-
-
-/*
- * Keyboard RGB backlight character device handler.
- * On systems supporting Acer gaming functions, a char device
- * will be exposed to communicate with user space
- * for keyboard RGB backlight configurations.
- * Similar to above, but for handling static coloring
- */
-
-
-struct led_zone_set_param {
-		u8 zone;
-		u8 red;
-		u8 green;
-		u8 blue;
-} __packed;
-
-static ssize_t gkbbl_static_drv_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
-{
-	u8 config_buf[4]={0,0,0,0};
-	unsigned long err;
-	struct led_zone_set_param set_params;
-	struct acpi_buffer set_input;
-	err = copy_from_user(config_buf, buf, GAMING_KBBL_STATIC_CONFIG_LEN);
-	set_params = (struct led_zone_set_param) {
-		.zone = config_buf[0],
-		.red = config_buf[1],
-		.green = config_buf[2],
-		.blue = config_buf[3],
-	};
-	set_input = (struct acpi_buffer) {
-		sizeof(set_params),
-		&set_params
-	};
-
-	if (count != GAMING_KBBL_STATIC_CONFIG_LEN) {
-		pr_err("Invalid data given to gaming keyboard static backlight");
-		return 0;
-	}
-
-	if (err < 0)
-		pr_err("Copying data from userspace failed with code: %lu\n", err);
-
-	wmi_evaluate_method( WMID_GUID4, 0, ACER_WMID_SET_GAMING_STATIC_LED_METHODID, &set_input, NULL);
-	return count;
-}
-
-
-static const struct file_operations gkbbl_static_dev_fops = {
-		.owner      = THIS_MODULE,
-		.write       = gkbbl_static_drv_write
-};
-
-static struct class *gkbbl_static_dev_class;
-static struct gkbbl_device_data gkbbl_static_dev_data;
-
-static int gkbbl_static_dev_uevent(
-#if RTLNX_VER_MIN(6, 2, 0)
-const
-#endif
-struct device *dev, struct kobj_uevent_env *env)
-{
-	add_uevent_var(env, "DEVMODE=%#o", 0666);
-	return 0;
-}
-
-static int __init gaming_kbbl_static_cdev_init(void)
-{
-	dev_t dev;
-	int err;
-
-	err = alloc_chrdev_region(&dev, 0, 1, GAMING_KBBL_STATIC_CHR);
-	if (err < 0) {
-		pr_err("Char drive registering for gaming keyboard static backlight failed: %d\n", err);
-		return err;
-	}
-
-	gkbbl_static_dev = dev;
-
-	#if RTLNX_VER_MIN(6, 4, 0)
-		gkbbl_static_dev_class = class_create(GAMING_KBBL_STATIC_CHR);
-	#else
-		gkbbl_static_dev_class = class_create(THIS_MODULE, GAMING_KBBL_STATIC_CHR);
-	#endif
-
-	gkbbl_static_dev_class->dev_uevent = gkbbl_static_dev_uevent;
-
-	cdev_init(&gkbbl_static_dev_data.cdev, &gkbbl_static_dev_fops);
-	gkbbl_static_dev_data.cdev.owner = THIS_MODULE;
-
-	cdev_add(&gkbbl_static_dev_data.cdev, gkbbl_static_dev, 1);
-
-	device_create(gkbbl_static_dev_class, NULL, gkbbl_static_dev, NULL, "%s-%d",
-				  GAMING_KBBL_STATIC_CHR,
-				  GAMING_KBBL_STATIC_MINOR);
-
-	return 0;
-}
-
-static int __init gaming_kbbl_poll_and_enable_zones(void)
-{
-	u64 gaming_sysinfo;
-	/*
-	 * Querying GetGamingSysInfo appears to be required to enable Nitro AN515-57
-	 * and possibly other Acer (Predator/Nitro) 4 zone LED keyboards.
-	 */
-	WMI_gaming_execute_u64(ACER_WMID_GET_GAMING_SYS_INFO_METHODID, 0, &gaming_sysinfo);
-	/* Turn on all 4 zones */
-	WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_LED_METHODID, 8L | (15UL<<40), NULL);
-	return 0;
-}
-
-static void __exit gaming_kbbl_static_cdev_exit(void)
-{
-	device_destroy(gkbbl_static_dev_class, gkbbl_static_dev);
-
-	class_unregister(gkbbl_static_dev_class);
-	class_destroy(gkbbl_static_dev_class);
-	cdev_del(&gkbbl_static_dev_data.cdev);
-
-	unregister_chrdev_region(gkbbl_static_dev, 1);
 }
 
 /*
@@ -2077,7 +1679,7 @@ static int acer_backlight_init(struct device *dev)
 
 	acer_backlight_device = bd;
 
-	bd->props.power = FB_BLANK_UNBLANK;
+	bd->props.power = BACKLIGHT_POWER_ON;
 	bd->props.brightness = read_brightness(bd);
 	backlight_update_status(bd);
 	return 0;
@@ -2616,50 +2218,25 @@ static void acer_rfkill_exit(void)
 	}
 }
 
-static void acer_wmi_notify(
-#if RTLNX_VER_MIN(6, 12, 0)
-	union acpi_object *obj
-#else
-	u32 value
-#endif
-	, void *context)
+static void acer_wmi_notify(union acpi_object *obj, void *context)
 {
 	struct event_return_value return_value;
 	u16 device_state;
 	const struct key_entry *key;
 	u32 scancode;
 
-#if RTLNX_VER_MAX(6, 12, 0)
-	struct acpi_buffer response = { ACPI_ALLOCATE_BUFFER, NULL };
-	acpi_status status = wmi_get_event_data(value, &response);
-	if (status != AE_OK) {
-		pr_warn("bad event status 0x%x\n", status);
-		return;
-	}
-	union acpi_object *obj = (union acpi_object *)response.pointer;
-#endif
-
 	if (!obj)
 		return;
 	if (obj->type != ACPI_TYPE_BUFFER) {
 		pr_warn("Unknown response received %d\n", obj->type);
-#if RTLNX_VER_MAX(6, 12, 0)
-		kfree(obj);
-#endif
 		return;
 	}
 	if (obj->buffer.length != 8) {
 		pr_warn("Unknown buffer length %d\n", obj->buffer.length);
-#if RTLNX_VER_MAX(6, 12, 0)
-		kfree(obj);
-#endif
 		return;
 	}
 
 	return_value = *((struct event_return_value *)obj->buffer.pointer);
-#if RTLNX_VER_MAX(6, 12, 0)
-	kfree(obj);
-#endif
 
 	switch (return_value.function) {
 	case WMID_HOTKEY_EVENT:
@@ -3054,13 +2631,13 @@ static void acer_platform_shutdown(struct platform_device *device)
 }
 
 static struct platform_driver acer_platform_driver = {
-		.driver = {
-				.name = "acer-wmi",
-				.pm = &acer_pm,
-		},
-		.probe = acer_platform_probe,
-		.remove = (void*)acer_platform_remove,
-		.shutdown = acer_platform_shutdown,
+	.driver = {
+		.name = "acer-wmi",
+		.pm = &acer_pm,
+	},
+	.probe = acer_platform_probe,
+	.remove = acer_platform_remove,
+	.shutdown = acer_platform_shutdown,
 };
 
 static struct platform_device *acer_platform_device;
@@ -3185,11 +2762,8 @@ static int __init acer_wmi_init(void)
 	if (!wmi_has_guid(AMW0_GUID1) && wmi_has_guid(WMID_GUID1))
 		interface = &wmid_interface;
 
-	if (wmi_has_guid(WMID_GUID3)) {
+	if (wmi_has_guid(WMID_GUID3))
 		interface = &wmid_v2_interface;
-		if (wmi_has_guid(WMID_GUID4))
-			gaming_interface = &wmid_gaming_interface;
-	}
 
 	if (interface)
 		dmi_walk(type_aa_dmi_decode, NULL);
@@ -3228,15 +2802,8 @@ static int __init acer_wmi_init(void)
 	if (acpi_video_get_backlight_type() != acpi_backlight_vendor)
 		interface->capability &= ~ACER_CAP_BRIGHTNESS;
 
-	if (wmi_has_guid(WMID_GUID3)) {
+	if (wmi_has_guid(WMID_GUID3))
 		interface->capability |= ACER_CAP_SET_FUNCTION_MODE;
-		if (wmi_has_guid(WMID_GUID4)) {
-			gaming_interface->capability |= ACER_CAP_GAMINGKB | ACER_CAP_GAMINGKB_STATIC;
-			gaming_kbbl_cdev_init();
-			gaming_kbbl_static_cdev_init();
-			gaming_kbbl_poll_and_enable_zones();
-		}
-	}
 
 	if (force_caps != -1)
 		interface->capability = force_caps;
@@ -3314,11 +2881,6 @@ static void __exit acer_wmi_exit(void)
 
 	if (acer_wmi_accel_dev)
 		input_unregister_device(acer_wmi_accel_dev);
-
-	if (wmi_has_guid(WMID_GUID4)) {
-		gaming_kbbl_cdev_exit();
-		gaming_kbbl_static_cdev_exit();
-	}
 
 	remove_debugfs();
 	platform_device_unregister(acer_platform_device);
